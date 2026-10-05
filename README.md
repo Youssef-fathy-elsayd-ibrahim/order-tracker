@@ -40,6 +40,8 @@ curl -i http://localhost:8000/api/orders/standard-1001
 
 The same telemetry remains available in the container logs with `docker compose logs app` and `docker compose logs otel-collector`.
 
+Grafana also provisions **Order Tracker - 5xx Errors**, which evaluates order lookup `5xx` responses over a five-minute window every 10 seconds. With no matching 5xx series, the query has no data and Grafana maps that state to **Normal**; query execution errors remain **Error**. Inspect the rule under **Alerting / Alert rules**. This rule has no notification integration configured.
+
 If port 8000 is occupied, set `ORDER_TRACKER_PORT`, for example:
 
 ```bash
