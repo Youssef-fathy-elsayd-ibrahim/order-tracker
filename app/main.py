@@ -8,11 +8,21 @@ from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
+from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
+from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry._logs import SeverityNumber
 from opentelemetry.sdk._logs import LoggerProvider
-from opentelemetry.sdk._logs.export import ConsoleLogRecordExporter, SimpleLogRecordProcessor
+from opentelemetry.sdk._logs.export import (
+    ConsoleLogRecordExporter,
+    SimpleLogRecordProcessor,
+)
 from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import ConsoleMetricExporter, InMemoryMetricReader
+from opentelemetry.sdk.metrics.export import (
+    ConsoleMetricExporter,
+    InMemoryMetricReader,
+    PeriodicExportingMetricReader,
+)
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import Status, StatusCode, TracerProvider
 from opentelemetry.sdk.trace.export import ConsoleSpanExporter, SimpleSpanProcessor
@@ -23,10 +33,22 @@ DB_PATH = Path(os.getenv("ORDER_DB_PATH", "data/orders.db"))
 STATUSES = {"received", "preparing", "shipped", "delivered"}
 ORDER_LOOKUP_ROUTE = "/api/orders/{order_id}"
 telemetry_resource = Resource.create({"service.name": "order-tracker"})
+otlp_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
 
 metric_reader = InMemoryMetricReader()
 metric_exporter = ConsoleMetricExporter(out=sys.stdout)
-meter_provider = MeterProvider(resource=telemetry_resource, metric_readers=[metric_reader])
+metric_readers = [metric_reader]
+if otlp_endpoint:
+    metric_readers.append(
+        PeriodicExportingMetricReader(
+            OTLPMetricExporter(),
+            export_interval_millis=5_000,
+        )
+    )
+meter_provider = MeterProvider(
+    resource=telemetry_resource,
+    metric_readers=metric_readers,
+)
 order_lookup_requests = meter_provider.get_meter(__name__).create_counter(
     "order.lookup.requests",
     description="Number of order lookup requests",
@@ -35,12 +57,16 @@ order_lookup_requests = meter_provider.get_meter(__name__).create_counter(
 
 tracer_provider = TracerProvider(resource=telemetry_resource)
 tracer_provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter(out=sys.stdout)))
+if otlp_endpoint:
+    tracer_provider.add_span_processor(SimpleSpanProcessor(OTLPSpanExporter()))
 tracer = tracer_provider.get_tracer(__name__)
 
 logger_provider = LoggerProvider(resource=telemetry_resource)
 logger_provider.add_log_record_processor(
     SimpleLogRecordProcessor(ConsoleLogRecordExporter(out=sys.stdout))
 )
+if otlp_endpoint:
+    logger_provider.add_log_record_processor(SimpleLogRecordProcessor(OTLPLogExporter()))
 telemetry_logger = logger_provider.get_logger(__name__)
 
 
