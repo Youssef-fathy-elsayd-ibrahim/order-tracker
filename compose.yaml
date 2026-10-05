@@ -83,6 +83,37 @@ services:
       tempo:
         condition: service_started
     restart: unless-stopped
+  incident-response:
+    image: order-tracker-incident-response:local
+    build: ./incident-response
+    ports:
+      - "127.0.0.1:8001:8001"
+    environment:
+      INCIDENT_DIR: /incidents
+      ORDER_TRACKER_REPO: /workspace
+      LOKI_URL: http://loki:3100
+      TEMPO_URL: http://tempo:3200
+      AGENT_TIMEOUT_SECONDS: ${AGENT_TIMEOUT_SECONDS:-180}
+      AGENT_COMMAND: "${AGENT_COMMAND:-}"
+      AGENT_ARGS_JSON: "${AGENT_ARGS_JSON:-[]}"
+    volumes:
+      - ./incident-response/incidents:/incidents
+      - ./app:/workspace/app:ro
+      - ./tests:/workspace/tests:ro
+      - ./static:/workspace/static:ro
+      - ./README.md:/workspace/README.md:ro
+      - ./pyproject.toml:/workspace/pyproject.toml:ro
+    depends_on:
+      loki:
+        condition: service_started
+      tempo:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/healthz', timeout=3)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
 
 volumes:
   orders:
