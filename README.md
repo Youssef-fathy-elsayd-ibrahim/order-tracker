@@ -1,6 +1,6 @@
 # Order Tracker
 
-A small order tracking app for the AI Dev Tools Zoomcamp observability homework. It includes a web page, API, tests, and a Docker Compose setup. You add telemetry, alerts, and an incident responder in Homework 4.
+A small order tracking app for the AI Dev Tools Zoomcamp observability homework. It includes a web page, API, tests, and a Docker Compose setup. Homework 4 adds observability and incident response in stages.
 
 The main user flow is creating an order and checking its status. Three sample orders are created on first startup.
 
@@ -13,6 +13,8 @@ docker compose up --build -d --wait
 ```
 
 Open <http://127.0.0.1:8000>. The API is at `/api/orders`, and the health check is at `/healthz`. Data is stored in a Docker volume and survives container recreation.
+
+Order lookup requests to `/api/orders/{order_id}` emit OpenTelemetry metrics, logs, and traces to the app's standard output. Inspect them with `docker compose logs app`; no telemetry backend is configured at this stage.
 
 If port 8000 is occupied, set `ORDER_TRACKER_PORT`, for example:
 

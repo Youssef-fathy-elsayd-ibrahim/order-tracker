@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -7,11 +8,40 @@ from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
+from opentelemetry._logs import SeverityNumber
+from opentelemetry.sdk._logs import LoggerProvider
+from opentelemetry.sdk._logs.export import ConsoleLogRecordExporter, SimpleLogRecordProcessor
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import ConsoleMetricExporter, InMemoryMetricReader
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import Status, StatusCode, TracerProvider
+from opentelemetry.sdk.trace.export import ConsoleSpanExporter, SimpleSpanProcessor
 from pydantic import BaseModel, Field
 
 
 DB_PATH = Path(os.getenv("ORDER_DB_PATH", "data/orders.db"))
 STATUSES = {"received", "preparing", "shipped", "delivered"}
+ORDER_LOOKUP_ROUTE = "/api/orders/{order_id}"
+telemetry_resource = Resource.create({"service.name": "order-tracker"})
+
+metric_reader = InMemoryMetricReader()
+metric_exporter = ConsoleMetricExporter(out=sys.stdout)
+meter_provider = MeterProvider(resource=telemetry_resource, metric_readers=[metric_reader])
+order_lookup_requests = meter_provider.get_meter(__name__).create_counter(
+    "order.lookup.requests",
+    description="Number of order lookup requests",
+    unit="{request}",
+)
+
+tracer_provider = TracerProvider(resource=telemetry_resource)
+tracer_provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter(out=sys.stdout)))
+tracer = tracer_provider.get_tracer(__name__)
+
+logger_provider = LoggerProvider(resource=telemetry_resource)
+logger_provider.add_log_record_processor(
+    SimpleLogRecordProcessor(ConsoleLogRecordExporter(out=sys.stdout))
+)
+telemetry_logger = logger_provider.get_logger(__name__)
 
 
 def connect():
@@ -60,6 +90,51 @@ def order_detail(row):
     return order
 
 
+def lookup_order(order_id):
+    with connect() as db:
+        row = db.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "Order not found")
+    return order_detail(row)
+
+
+def record_order_lookup(status_code):
+    order_lookup_requests.add(
+        1,
+        {
+            "http.route": ORDER_LOOKUP_ROUTE,
+            "http.response.status_code": status_code,
+        },
+    )
+    metrics_data = metric_reader.get_metrics_data()
+    if metrics_data is not None:
+        metric_exporter.export(metrics_data)
+
+
+def emit_order_lookup_log(status_code, found, error_type=None):
+    severity = SeverityNumber.INFO
+    body = "Order lookup completed"
+    if status_code >= 500:
+        severity = SeverityNumber.ERROR
+        body = "Order lookup failed"
+    elif not found:
+        severity = SeverityNumber.WARN
+        body = "Order lookup not found"
+
+    attributes = {
+        "http.route": ORDER_LOOKUP_ROUTE,
+        "http.response.status_code": status_code,
+        "order.found": found,
+    }
+    if error_type is not None:
+        attributes["error.type"] = error_type
+    telemetry_logger.emit(
+        severity_number=severity,
+        body=body,
+        attributes=attributes,
+    )
+
+
 class NewOrder(BaseModel):
     customer: str = Field(min_length=1, max_length=80)
     item: str = Field(min_length=1, max_length=120)
@@ -100,11 +175,32 @@ def list_orders():
 
 @app.get("/api/orders/{order_id}")
 def get_order(order_id: str):
-    with connect() as db:
-        row = db.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
-    if row is None:
-        raise HTTPException(404, "Order not found")
-    return order_detail(row)
+    status_code = 500
+    found = False
+    with tracer.start_as_current_span("order lookup") as span:
+        span.set_attribute("http.route", ORDER_LOOKUP_ROUTE)
+        span.set_attribute("http.request.method", "GET")
+        try:
+            order = lookup_order(order_id)
+        except HTTPException as exc:
+            status_code = exc.status_code
+            if status_code >= 500:
+                span.set_status(Status(StatusCode.ERROR))
+            emit_order_lookup_log(status_code, found)
+            raise
+        except Exception as exc:
+            span.set_status(Status(StatusCode.ERROR))
+            emit_order_lookup_log(status_code, found, type(exc).__name__)
+            raise
+        else:
+            status_code = 200
+            found = True
+            emit_order_lookup_log(status_code, found)
+            return order
+        finally:
+            span.set_attribute("http.response.status_code", status_code)
+            span.set_attribute("order.found", found)
+            record_order_lookup(status_code)
 
 
 @app.post("/api/orders", status_code=201)
@@ -118,7 +214,7 @@ def create_order(order: NewOrder):
             (order_id, order.customer, order.item, order.priority, "received",
              datetime.now(timezone.utc).isoformat()),
         )
-    return get_order(order_id)
+    return lookup_order(order_id)
 
 
 @app.patch("/api/orders/{order_id}")
@@ -132,4 +228,4 @@ def update_status(order_id: str, update: StatusUpdate):
         )
     if cursor.rowcount == 0:
         raise HTTPException(404, "Order not found")
-    return get_order(order_id)
+    return lookup_order(order_id)
