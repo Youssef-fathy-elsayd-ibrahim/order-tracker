@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -16,6 +18,19 @@ def test_health_and_seeded_orders(client):
     orders = client.get("/api/orders").json()
     assert len(orders) == 3
     assert {order["priority"] for order in orders} == {"standard", "express"}
+
+
+def test_express_seeded_order_estimated_delivery_crosses_month_end(client):
+    response = client.get("/api/orders/express-1002")
+
+    assert response.status_code == 200
+    order = response.json()
+    placed_at = datetime.fromisoformat(order["created_at"])
+    estimated_at = placed_at + timedelta(days=2)
+    assert (placed_at + timedelta(days=1)).day == 1
+    assert order["estimated_delivery"] == estimated_at.date().isoformat()
+    assert estimated_at.day == 2
+    assert estimated_at.month != placed_at.month
 
 
 def test_create_and_update_order(client):

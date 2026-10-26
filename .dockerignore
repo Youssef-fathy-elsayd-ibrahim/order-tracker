@@ -3,6 +3,7 @@
 .pytest_cache
 __pycache__
 data
-tests
+!tests
+!tests/**
 k8s
 scripts

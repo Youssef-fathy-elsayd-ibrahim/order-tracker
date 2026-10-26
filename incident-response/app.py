@@ -1,3 +1,4 @@
+import hmac
 import json
 import os
 import re
@@ -12,7 +13,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
+from pydantic import BaseModel, Field
 
 
 ROUTE_DEFAULT = "/api/orders/{order_id}"
@@ -22,14 +24,28 @@ REPOSITORY_ROOT = Path(
 )
 LOKI_URL = os.getenv("LOKI_URL", "http://localhost:3100").rstrip("/")
 TEMPO_URL = os.getenv("TEMPO_URL", "http://localhost:3200").rstrip("/")
+ORDER_TRACKER_URL = os.getenv("ORDER_TRACKER_URL", "http://localhost:8000").rstrip("/")
+APPROVAL_TOKEN = os.environ.pop("IR_APPROVAL_TOKEN", "").strip()
+TEST_TIMEOUT_SECONDS = 300
 MAX_RESPONSE_BYTES = 2_000_000
 MAX_PROMPT_BYTES = 80_000
 
 app = FastAPI(title="Order Tracker Incident Response")
 
 
+class VerificationApproval(BaseModel):
+    approved: bool
+    remediation_summary: str = Field(min_length=1, max_length=1000)
+
+
 def _mapping(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _child_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    environment.pop("IR_APPROVAL_TOKEN", None)
+    return environment
 
 
 def _text(value: Any, fallback: str = "") -> str:
@@ -199,7 +215,14 @@ def _loki_logs(route: str, start: int, end: int) -> dict[str, Any]:
     for attempt in range(4):
         try:
             data = _request_json(f"{LOKI_URL}/loki/api/v1/query_range?{params}")
-        except (HTTPError, URLError, TimeoutError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
+        except (
+            HTTPError,
+            URLError,
+            TimeoutError,
+            ValueError,
+            RuntimeError,
+            json.JSONDecodeError,
+        ) as exc:
             result["status"] = "error"
             result["error"] = _external_error(exc)
             return result
@@ -287,9 +310,10 @@ def _build_prompt(incident: dict[str, Any], logs: dict[str, Any], traces: dict[s
         f"Repository path: {REPOSITORY_ROOT}\n"
         f"Affected endpoint: {incident['endpoint']}\n"
         "Inspect the available application source and tests to identify the likely "
-        "root cause. Propose a concise, minimal fix appropriate for this Q5 exercise, "
-        "but do not edit files or run commands. State uncertainty explicitly and "
-        "finish with one concise answer line.\n\n"
+        "root cause. Propose a concise, minimal patch as a unified diff limited to "
+        "app/main.py, but do not edit files, run commands, or claim the incident is "
+        "resolved. A human must review and apply the patch. State uncertainty "
+        "explicitly and finish with one concise answer line.\n\n"
         f"Incident evidence (truncated to {MAX_PROMPT_BYTES} characters if necessary):\n"
         f"{evidence}"
     )
@@ -352,6 +376,7 @@ def _run_agent(prompt: str) -> dict[str, Any]:
             cwd=REPOSITORY_ROOT,
             check=False,
             shell=False,
+            env=_child_environment(),
         )
     except subprocess.TimeoutExpired as exc:
         return {
@@ -383,6 +408,71 @@ def _write_json(path: Path, value: Any) -> None:
     )
 
 
+def _incident_directory(incident_id: str) -> Path:
+    if not re.fullmatch(r"\d{8}T\d{6}Z-[0-9a-f-]{36}", incident_id):
+        raise HTTPException(status_code=404, detail="Incident not found")
+    incident_dir = (INCIDENT_ROOT / incident_id).resolve()
+    if incident_dir.parent != INCIDENT_ROOT.resolve() or not (
+        incident_dir / "incident.json"
+    ).is_file():
+        raise HTTPException(status_code=404, detail="Incident not found")
+    return incident_dir
+
+
+def _run_tests() -> dict[str, Any]:
+    try:
+        result = subprocess.run(
+            [
+                "uv",
+                "run",
+                "--project",
+                str(REPOSITORY_ROOT),
+                "--frozen",
+                "pytest",
+                "-q",
+                str(REPOSITORY_ROOT / "tests"),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=TEST_TIMEOUT_SECONDS,
+            cwd=REPOSITORY_ROOT,
+            check=False,
+            shell=False,
+            env=_child_environment(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "status": "timeout",
+            "exit_code": None,
+            "stdout": (exc.stdout or "") if isinstance(exc.stdout, str) else "",
+            "stderr": f"Test suite exceeded the {TEST_TIMEOUT_SECONDS}s timeout",
+        }
+    except OSError as exc:
+        return {
+            "status": "launch_error",
+            "exit_code": None,
+            "stdout": "",
+            "stderr": f"{type(exc).__name__}: {str(exc)[:400]}",
+        }
+
+    return {
+        "status": "passed" if result.returncode == 0 else "failed",
+        "exit_code": result.returncode,
+        "stdout": result.stdout[-40_000:],
+        "stderr": result.stderr[-40_000:],
+    }
+
+
+def _check_application_health() -> dict[str, Any]:
+    try:
+        response = _request_json(f"{ORDER_TRACKER_URL}/healthz", timeout=5)
+    except (HTTPError, URLError, TimeoutError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
+        return {"status": "error", "error": _external_error(exc)}
+    if _mapping(response).get("status") != "ok":
+        return {"status": "unhealthy", "response": response}
+    return {"status": "ok", "response": response}
+
+
 @app.get("/healthz")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -402,6 +492,7 @@ def receive_alert(payload: dict[str, Any]) -> dict[str, Any]:
     incident = {
         "incident_id": incident_id,
         "received_at": datetime.now(timezone.utc).isoformat(),
+        "resolution_status": "investigating",
         "endpoint": primary["endpoint"],
         "alert_name": primary["name"],
         "status": primary["status"],
@@ -444,9 +535,66 @@ def receive_alert(payload: dict[str, Any]) -> dict[str, Any]:
 
 @app.get("/incidents/{incident_id}")
 def get_incident(incident_id: str) -> dict[str, Any]:
-    if not re.fullmatch(r"\d{8}T\d{6}Z-[0-9a-f-]{36}", incident_id):
-        raise HTTPException(status_code=404, detail="Incident not found")
-    incident_file = (INCIDENT_ROOT / incident_id / "incident.json").resolve()
-    if incident_file.parent.parent != INCIDENT_ROOT.resolve() or not incident_file.is_file():
-        raise HTTPException(status_code=404, detail="Incident not found")
-    return json.loads(incident_file.read_text(encoding="utf-8"))
+    incident_dir = _incident_directory(incident_id)
+    return json.loads((incident_dir / "incident.json").read_text(encoding="utf-8"))
+
+
+@app.post("/incidents/{incident_id}/verify")
+def verify_remediation(
+    incident_id: str,
+    approval: VerificationApproval,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    if not approval.approved:
+        raise HTTPException(
+            status_code=409,
+            detail="A human must explicitly approve the remediation before verification",
+        )
+    if len(APPROVAL_TOKEN) < 32:
+        raise HTTPException(
+            status_code=503,
+            detail="Verification requires an IR_APPROVAL_TOKEN of at least 32 characters",
+        )
+    scheme, separator, token = (authorization or "").partition(" ")
+    if (
+        scheme.lower() != "bearer"
+        or not separator
+        or not hmac.compare_digest(token.strip().encode(), APPROVAL_TOKEN.encode())
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="A valid human approval token is required",
+        )
+
+    incident_dir = _incident_directory(incident_id)
+    incident_file = incident_dir / "incident.json"
+    incident = json.loads(incident_file.read_text(encoding="utf-8"))
+    tests = _run_tests()
+    health_check = _check_application_health()
+    verified = tests["status"] == "passed" and health_check["status"] == "ok"
+    verification = {
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+        "approved": True,
+        "remediation_summary": approval.remediation_summary,
+        "tests": tests,
+        "health_check": health_check,
+        "verified": verified,
+        "status": "resolved" if verified else "unresolved",
+    }
+    incident["resolution_status"] = verification["status"]
+    incident["remediation_summary"] = approval.remediation_summary
+    if verified:
+        incident["resolved_at"] = verification["requested_at"]
+    else:
+        incident.pop("resolved_at", None)
+
+    _write_json(incident_file, incident)
+    _write_json(incident_dir / "verification.json", verification)
+    return {
+        "incident_id": incident_id,
+        "resolution_status": verification["status"],
+        "verified": verified,
+        "tests_status": tests["status"],
+        "health_status": health_check["status"],
+        "verification_path": str(incident_dir / "verification.json"),
+    }

@@ -82,10 +82,14 @@ services:
         condition: service_started
       tempo:
         condition: service_started
+      incident-response:
+        condition: service_started
     restart: unless-stopped
   incident-response:
     image: order-tracker-incident-response:local
-    build: ./incident-response
+    build:
+      context: .
+      dockerfile: incident-response/Dockerfile
     ports:
       - "127.0.0.1:8001:8001"
     environment:
@@ -93,6 +97,8 @@ services:
       ORDER_TRACKER_REPO: /workspace
       LOKI_URL: http://loki:3100
       TEMPO_URL: http://tempo:3200
+      ORDER_TRACKER_URL: http://app:8000
+      IR_APPROVAL_TOKEN: ${IR_APPROVAL_TOKEN:-}
       AGENT_TIMEOUT_SECONDS: ${AGENT_TIMEOUT_SECONDS:-180}
       AGENT_COMMAND: "${AGENT_COMMAND:-}"
       AGENT_ARGS_JSON: "${AGENT_ARGS_JSON:-[]}"
@@ -104,6 +110,8 @@ services:
       - ./README.md:/workspace/README.md:ro
       - ./pyproject.toml:/workspace/pyproject.toml:ro
     depends_on:
+      app:
+        condition: service_started
       loki:
         condition: service_started
       tempo:
