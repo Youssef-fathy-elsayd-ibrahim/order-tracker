@@ -6,7 +6,8 @@ The main user flow is creating an order and checking its status. Three sample or
 
 ## Run it
 
-You need Docker with Compose. To run the tests, you also need Python 3.11+ and `uv`.
+You need Docker with Compose. To run the Python tests, you also need Python 3.11+
+and `uv`.
 
 ```bash
 docker compose up --build -d --wait
@@ -321,6 +322,24 @@ ORDER_TRACKER_PORT=18080 docker compose up --build -d --wait
 
 Run the application tests with `uv run --frozen pytest -q`, and the incident-responder tests with `uv run --directory incident-response --frozen pytest -q`. CI runs both test suites on pull requests and pushes to the default branch.
 
+### Browser tests
+
+Browser tests use Python Playwright and headless Chromium. Install the project
+dependencies and browser once, then run the separate browser suite in
+PowerShell:
+
+```powershell
+uv sync --frozen
+uv run --frozen playwright install chromium
+uv run --frozen pytest -q browser-tests
+```
+
+Each browser test starts its own local FastAPI process with a SQLite database
+under pytest's temporary directory and stops that process afterward. The tests
+do not use the development database or Docker volumes. CI runs them in a
+separate `browser-tests` job, installs Chromium, and uses the same temporary
+database fixture.
+
 Stop the app with `docker compose down`. Add `-v` only if you also want to delete the order data.
 
 ## Deployment and rollback
@@ -351,5 +370,17 @@ for responsibilities and incident handoffs.
 | POST | `/api/orders` | Create an order |
 | GET | `/api/orders/{id}` | Check an order |
 | PATCH | `/api/orders/{id}` | Change an order status |
+
+`docs/api/openapi.json` is the checked-in API contract generated from the
+running FastAPI application's OpenAPI schema. The automated drift test compares
+it with `app.openapi()` so API changes require an intentional snapshot update;
+this snapshot documents the current API and is not a claim that development was
+historically contract-first. After reviewing an intentional API change,
+regenerate it with:
+
+```powershell
+uv run --frozen python scripts/export_openapi.py
+uv run --frozen pytest -q tests/test_openapi_contract.py
+```
 
 The app uses SQLite to keep setup small. Run one app container at a time. The course exercise is about detecting and handling an incident, not scaling the database.

@@ -12,60 +12,109 @@
   form { display: flex; flex-wrap: wrap; gap: .6rem; margin: 1.5rem 0; }
   input, select, button { font: inherit; padding: .6rem; border-radius: 6px; border: 1px solid #aebec8; }
   button { background: #175f72; color: white; border-color: #175f72; cursor: pointer; }
+  button:disabled { cursor: wait; opacity: .7; }
   #orders { display: grid; gap: .7rem; }
   article { display: flex; justify-content: space-between; gap: 1rem; align-items: center; }
   article button { white-space: nowrap; }
   #detail { min-height: 1.5rem; margin: 1rem 0; }
   .error { color: #ac2525; }
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 </style>
 <h1>Order Tracker</h1>
 <p>Create an order, then open it to check its current status.</p>
-<form id="new-order">
-  <input name="customer" placeholder="Customer" required>
-  <input name="item" placeholder="Item" required>
-  <select name="priority"><option>standard</option><option>express</option></select>
-  <button>Create order</button>
+<form id="new-order" aria-label="Create an order">
+  <label class="sr-only" for="customer">Customer</label>
+  <input id="customer" name="customer" placeholder="Customer" required>
+  <label class="sr-only" for="item">Item</label>
+  <input id="item" name="item" placeholder="Item" required>
+  <label class="sr-only" for="priority">Priority</label>
+  <select id="priority" name="priority"><option>standard</option><option>express</option></select>
+  <button type="submit">Create order</button>
 </form>
-<div id="detail" role="status"></div>
-<div id="orders"></div>
+<div id="detail" role="status" aria-live="polite" aria-atomic="true"></div>
+<div id="orders" role="region" aria-label="Orders" aria-live="polite"></div>
 <script>
 const ordersEl = document.querySelector('#orders');
 const detailEl = document.querySelector('#detail');
+const orderForm = document.querySelector('#new-order');
+const createButton = orderForm.querySelector('button[type="submit"]');
+let submitting = false;
+
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
-async function loadOrders() {
-  const response = await fetch('/api/orders');
-  const orders = await response.json();
-  ordersEl.innerHTML = orders.map(order => `
-    <article>
-      <span><strong>${escapeHtml(order.item)}</strong> for ${escapeHtml(order.customer)}
-      · ${escapeHtml(order.priority)} · ${escapeHtml(order.status)}</span>
-      <button data-id="${escapeHtml(order.id)}">Check status</button>
-    </article>`).join('');
+
+function announce(message, isError = false) {
+  detailEl.textContent = message;
+  detailEl.className = isError ? 'error' : '';
+  detailEl.setAttribute('role', isError ? 'alert' : 'status');
+  detailEl.setAttribute('aria-live', isError ? 'assertive' : 'polite');
 }
-ordersEl.addEventListener('click', async event => {
-  const id = event.target.dataset.id;
-  if (!id) return;
-  const response = await fetch('/api/orders/' + encodeURIComponent(id));
-  if (!response.ok) {
-    detailEl.className = 'error';
-    detailEl.textContent = 'Could not check this order (' + response.status + ').';
-    return;
+
+async function loadOrders() {
+  try {
+    const response = await fetch('/api/orders');
+    if (!response.ok) {
+      announce(`Could not load orders (HTTP ${response.status}). Please try again.`, true);
+      return false;
+    }
+    const orders = await response.json();
+    ordersEl.innerHTML = orders.map(order => `
+      <article>
+        <span><strong>${escapeHtml(order.item)}</strong> for ${escapeHtml(order.customer)}
+        · ${escapeHtml(order.priority)} · ${escapeHtml(order.status)}</span>
+        <button data-id="${escapeHtml(order.id)}" aria-label="Check status for ${escapeHtml(order.item)}">Check status</button>
+      </article>`).join('');
+    return true;
+  } catch {
+    announce('Could not load orders. Check your connection and try again.', true);
+    return false;
   }
-  const order = await response.json();
-  detailEl.className = '';
-  detailEl.textContent = order.item + ' for ' + order.customer + ': ' + order.status
-    + (order.estimated_delivery ? ' · estimated delivery ' + order.estimated_delivery : '');
+}
+
+ordersEl.addEventListener('click', async event => {
+  const button = event.target.closest('button[data-id]');
+  if (!button) return;
+  try {
+    const response = await fetch('/api/orders/' + encodeURIComponent(button.dataset.id));
+    if (!response.ok) {
+      announce(`Could not check this order (HTTP ${response.status}). Please try again.`, true);
+      return;
+    }
+    const order = await response.json();
+    announce(order.item + ' for ' + order.customer + ': ' + order.status
+      + (order.estimated_delivery ? ' · estimated delivery ' + order.estimated_delivery : ''));
+  } catch {
+    announce('Could not check this order. Check your connection and try again.', true);
+  }
 });
-document.querySelector('#new-order').addEventListener('submit', async event => {
+
+orderForm.addEventListener('submit', async event => {
   event.preventDefault();
+  if (submitting) return;
+  submitting = true;
+  createButton.disabled = true;
+  createButton.textContent = 'Creating…';
   const data = Object.fromEntries(new FormData(event.target));
-  const response = await fetch('/api/orders', {
-    method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data)
-  });
-  if (response.ok) { event.target.reset(); await loadOrders(); }
+  try {
+    const response = await fetch('/api/orders', {
+      method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data)
+    });
+    if (!response.ok) {
+      announce(`Could not create order (HTTP ${response.status}). Please try again.`, true);
+      return;
+    }
+    event.target.reset();
+    if (await loadOrders()) announce('Order created. Check its status below.');
+  } catch {
+    announce('Could not create order. Check your connection and try again.', true);
+  } finally {
+    submitting = false;
+    createButton.disabled = false;
+    createButton.textContent = 'Create order';
+  }
 });
+
 loadOrders();
 </script>
 </html>
