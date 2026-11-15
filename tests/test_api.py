@@ -46,6 +46,34 @@ def test_create_and_update_order(client):
     assert updated.json()["status"] == "shipped"
 
 
+def test_order_persists_across_app_restart(tmp_path, monkeypatch):
+    database_path = tmp_path / "orders.db"
+    monkeypatch.setattr(main, "DB_PATH", database_path)
+
+    with TestClient(main.app) as first_client:
+        created = first_client.post(
+            "/api/orders",
+            json={"customer": "Taylor", "item": "Mug", "priority": "standard"},
+        )
+        assert created.status_code == 201
+        order_id = created.json()["id"]
+
+        updated = first_client.patch(
+            f"/api/orders/{order_id}", json={"status": "shipped"}
+        )
+        assert updated.status_code == 200
+        assert updated.json()["status"] == "shipped"
+
+    with TestClient(main.app) as second_client:
+        persisted = second_client.get(f"/api/orders/{order_id}")
+
+    assert persisted.status_code == 200
+    assert persisted.json()["id"] == order_id
+    assert persisted.json()["customer"] == "Taylor"
+    assert persisted.json()["item"] == "Mug"
+    assert persisted.json()["status"] == "shipped"
+
+
 def test_missing_order(client):
     assert client.get("/api/orders/missing").status_code == 404
 
