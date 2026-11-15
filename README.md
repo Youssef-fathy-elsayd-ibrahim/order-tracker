@@ -176,12 +176,139 @@ Invoke-RestMethod -Method Post `
   -Body $body
 ```
 
-To smoke-test alert collection, POST an alert payload:
+### Direct webhook smoke test (not end-to-end)
+
+This sends an alert directly to the responder and bypasses Grafana's alert rule;
+it does not demonstrate the Grafana-to-responder flow below.
 
 ```bash
 curl -X POST http://localhost:8001/alerts \
   -H "Content-Type: application/json" \
   -d "{\"alertname\":\"Local smoke test\",\"status\":\"firing\",\"endpoint\":\"/api/orders/{order_id}\",\"description\":\"Local responder smoke test\"}"
+```
+
+### Reproducible Grafana-to-responder demonstration (isolated)
+
+This is the end-to-end demonstration: Grafana evaluates the app's `5xx` metric
+and sends a firing alert to the responder. It is separate from the direct
+webhook smoke test above, which bypasses Grafana, and from the previously
+recorded October 22, 2026 incident. This run creates a new incident in its own
+named volume and does not access or overwrite `incident-response/incidents/`.
+
+Run from the repository root in PowerShell. The demo uses the same host ports as
+the normal stack, so first stop that stack without removing its containers or
+volumes. The different Compose project name also gives the demo its own app
+database and observability volumes.
+
+```powershell
+$demoCompose = @('-p', 'order-tracker-demo', '-f', 'compose.yaml', '-f', 'compose.demo.yaml')
+$demoConfig = docker compose @demoCompose config --format json | ConvertFrom-Json
+$incidentMount = @($demoConfig.services.'incident-response'.volumes |
+  Where-Object { $_.target -eq '/incidents' })
+if ($incidentMount.Count -ne 1 -or $incidentMount[0].type -ne 'volume') {
+  throw 'Demo responder must use a named volume at /incidents, not a host bind mount'
+}
+$incidentMount | Select-Object type, source, target
+$demoConfig.volumes.PSObject.Properties |
+  Select-Object Name, @{Name='docker_volume';Expression={$_.Value.name}}
+
+docker compose stop
+docker compose @demoCompose up -d --wait
+```
+
+The config check should show a `volume` mount at `/incidents` with source
+`demo-incidents`, not the repository's incident directory. The top-level volume
+configuration shows its Docker name as `order-tracker-demo_demo-incidents`;
+similarly, app and observability volumes are prefixed with
+`order-tracker-demo_`. The regular stack is stopped, not removed.
+
+The app's metric exporter runs every 5 seconds; [Prometheus](./prometheus.yml)
+scrapes every 2 seconds and evaluates every 5 seconds. The Grafana alert group
+evaluates every 10 seconds and looks back 5 minutes. The following controlled
+failure changes only the seeded `express-1002` timestamp in the isolated demo
+database. Save that timestamp and the existing demo incident IDs first; the
+`finally` block restores the timestamp even if a check fails.
+
+```powershell
+$originalTimestamp = (Invoke-RestMethod 'http://localhost:8000/api/orders/express-1002').created_at
+if (-not $originalTimestamp) { throw 'Could not save the demo order timestamp' }
+$beforeIncidentIds = @(
+  docker compose @demoCompose exec -T incident-response python -c "from pathlib import Path; print('\n'.join(sorted(p.name for p in Path('/incidents').iterdir() if p.is_dir())))"
+)
+
+try {
+  docker compose @demoCompose exec -T app python -c "import sqlite3; db=sqlite3.connect('/data/orders.db'); db.execute('UPDATE orders SET created_at=? WHERE id=?', ('not-a-timestamp','express-1002')); db.commit(); db.close()"
+  if ($LASTEXITCODE -ne 0) { throw 'Could not inject the isolated demo failure' }
+
+  foreach ($attempt in 1..2) {
+    $status = $null
+    try {
+      $response = Invoke-WebRequest -UseBasicParsing 'http://localhost:8000/api/orders/express-1002'
+      $status = [int]$response.StatusCode
+    } catch {
+      if ($_.Exception.Response) {
+        $status = [int]$_.Exception.Response.StatusCode
+      } else {
+        throw
+      }
+    }
+    if ($status -ne 500) { throw "Expected the controlled lookup to return 500; got $status" }
+    "Expected demo failure: HTTP $status"
+    if ($attempt -eq 1) { Start-Sleep -Seconds 3 }
+  }
+
+  # Allow export, scrape, Grafana evaluation, and notification dispatch to complete.
+  Start-Sleep -Seconds 60
+
+  $auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes('admin:admin'))
+  $headers = @{ Authorization = "Basic $auth" }
+  $activeAlerts = Invoke-RestMethod `
+    'http://localhost:3000/api/alertmanager/grafana/api/v2/alerts' -Headers $headers
+  $activeAlerts |
+    Where-Object { $_.labels.alertname -eq 'Order Tracker - 5xx Errors' } |
+    Select-Object @{Name='alertname';Expression={$_.labels.alertname}},
+      @{Name='state';Expression={$_.status.state}}
+  # Also check Grafana: Alerting > Alert rules > Order Tracker - 5xx Errors (Firing).
+
+  docker compose @demoCompose logs --since 10m incident-response |
+    Select-String 'POST /alerts.*202'
+
+  $afterIncidentIds = @(
+    docker compose @demoCompose exec -T incident-response python -c "from pathlib import Path; print('\n'.join(sorted(p.name for p in Path('/incidents').iterdir() if p.is_dir())))"
+  )
+  $newIncidentIds = @($afterIncidentIds | Where-Object { $_ -and $_ -notin $beforeIncidentIds })
+  if ($newIncidentIds.Count -eq 0) { throw 'No new incident was persisted by the demo responder' }
+  $incidentId = ($newIncidentIds | Sort-Object | Select-Object -Last 1).Trim()
+
+  $incident = Invoke-RestMethod "http://localhost:8001/incidents/$incidentId"
+  $incident | Select-Object incident_id, status, resolution_status, alert_name, http_status_code |
+    Format-List
+  if ($incident.resolution_status -ne 'investigating') {
+    throw "Expected resolution_status=investigating, got $($incident.resolution_status)"
+  }
+
+  $evidenceCommand = "from pathlib import Path; import sys; d=Path('/incidents')/sys.argv[1]; [print('--- '+n+' ---\n'+(d/n).read_text(encoding='utf-8')) for n in ('incident.json','logs.json','traces.json')]"
+  docker compose @demoCompose exec -T incident-response python -c $evidenceCommand $incidentId
+} finally {
+  docker compose @demoCompose exec -T app python -c "import sqlite3,sys; db=sqlite3.connect('/data/orders.db'); db.execute('UPDATE orders SET created_at=? WHERE id=?',(sys.argv[1],'express-1002')); db.commit(); db.close()" "$originalTimestamp"
+  if ($LASTEXITCODE -ne 0) { throw 'Failed to restore the demo order timestamp' }
+  $restoredTimestamp = (Invoke-RestMethod 'http://localhost:8000/api/orders/express-1002').created_at
+  if ($restoredTimestamp -ne $originalTimestamp) { throw 'Demo order timestamp was not restored' }
+}
+```
+
+The responder access log should show `POST /alerts` with `202`; the newly
+persisted `incident.json` should have `resolution_status: investigating`, and
+the same incident directory contains `logs.json` and `traces.json`.
+**Do not call `/verify` during this demonstration.** A demo incident volume may
+retain evidence between runs; compare IDs against the pre-run list as above.
+
+When finished, stop the demo without deleting its containers or volumes, then
+restart the original stack:
+
+```powershell
+docker compose @demoCompose stop
+docker compose up -d --wait
 ```
 
 An assistant executable installed inside the responder image can be configured with trusted `AGENT_COMMAND` and optional `AGENT_ARGS_JSON` environment settings; the latter is a JSON argument array and supports `{prompt}` as an argument placeholder. Arguments are executed without a shell. No coding-assistant CLI is bundled in the responder image; when none is configured, the incident is still saved and the agent status records that it was unavailable.

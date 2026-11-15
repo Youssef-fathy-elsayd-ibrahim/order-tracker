@@ -1,0 +1,9 @@
+services:
+  incident-response:
+    volumes:
+      - type: volume
+        source: demo-incidents
+        target: /incidents
+
+volumes:
+  demo-incidents:
