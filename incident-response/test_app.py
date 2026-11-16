@@ -373,7 +373,19 @@ def test_agent_failures_are_accepted_and_leave_incident_investigating(
 
 def test_test_runner_uses_fixed_project_pytest_command(monkeypatch):
     calls = []
-    monkeypatch.setenv("IR_APPROVAL_TOKEN", "test-secret")
+    runtime_environment = {
+        "PATH": "test-path",
+        "HOME": "test-home",
+        "TMPDIR": "test-temp",
+        "LANG": "C.UTF-8",
+    }
+    for name, value in runtime_environment.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("IR_APPROVAL_TOKEN", "approval-secret")
+    monkeypatch.setenv("COPILOT_GITHUB_TOKEN", TEST_COPILOT_TOKEN)
+    monkeypatch.setenv("GH_TOKEN", "gh-secret")
+    monkeypatch.setenv("GITHUB_TOKEN", "github-secret")
+    monkeypatch.setenv("UNRELATED_SECRET", "must-not-pass")
     monkeypatch.setattr(
         responder.subprocess,
         "run",
@@ -402,7 +414,13 @@ def test_test_runner_uses_fixed_project_pytest_command(monkeypatch):
     ]
     assert options["shell"] is False
     assert options["cwd"] == responder.REPOSITORY_ROOT
-    assert "IR_APPROVAL_TOKEN" not in options["env"]
+    assert options["env"] == runtime_environment
+    assert not {
+        "IR_APPROVAL_TOKEN",
+        "COPILOT_GITHUB_TOKEN",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+    }.intersection(options["env"])
 
 
 def create_incident(client):

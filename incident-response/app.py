@@ -49,9 +49,12 @@ def _mapping(value: Any) -> dict[str, Any]:
 
 
 def _child_environment() -> dict[str, str]:
-    environment = os.environ.copy()
-    environment.pop("IR_APPROVAL_TOKEN", None)
-    return environment
+    runtime_variables = ("PATH", "HOME", "TMPDIR", "LANG")
+    return {
+        name: os.environ[name]
+        for name in runtime_variables
+        if name in os.environ
+    }
 
 
 def _text(value: Any, fallback: str = "") -> str:
