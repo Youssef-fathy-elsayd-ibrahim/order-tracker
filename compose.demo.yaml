@@ -1,5 +1,7 @@
 services:
   incident-response:
+    environment:
+      COPILOT_GITHUB_TOKEN: ""
     volumes:
       - type: volume
         source: demo-incidents

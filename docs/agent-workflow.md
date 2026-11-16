@@ -8,8 +8,8 @@
 - **Testing:** run the affected project test suite and report the exact command
   and result; do not treat an agent's claim as test evidence.
 - **Incident responder:** collect logs and traces, investigate the likely cause,
-  and propose a minimal patch. Configure its CLI with no-edit/no-tools
-  permissions; the responder's prompt is not a sandbox.
+  and propose a minimal patch. Its Copilot CLI is restricted to read-only tools;
+  the responder's prompt is not a sandbox.
 - **Reviewer / Safety:** inspect the patch and its scope, confirm a human approved
   it before application, and require passing tests and a healthy service before
   resolution.

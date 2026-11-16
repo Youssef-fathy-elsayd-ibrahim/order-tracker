@@ -21,7 +21,8 @@ or distinguish roles.
    returns its current status and, for express orders, an estimated delivery
    date. Lookup failures are announced in the page.
 4. **Update status:** an API client may submit a valid status update. The API
-   returns the updated order; invalid status values are rejected.
+   returns the updated order; invalid status values are rejected. The current
+   web page has no status-update control.
 
 ## API behavior and validation
 

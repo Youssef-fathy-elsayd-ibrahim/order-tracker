@@ -1,0 +1,4 @@
+services:
+  incident-response:
+    environment:
+      COPILOT_GITHUB_TOKEN: ${COPILOT_GITHUB_TOKEN:?missing}

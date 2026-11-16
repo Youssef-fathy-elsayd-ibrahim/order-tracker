@@ -43,7 +43,7 @@ services:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus:/prometheus
     ports:
-      - "127.0.0.1:9090:9090"
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
     restart: unless-stopped
   loki:
     image: grafana/loki:3.3.2
@@ -52,7 +52,7 @@ services:
       - ./loki-config.yaml:/etc/loki/config.yaml:ro
       - loki:/loki
     ports:
-      - "127.0.0.1:3100:3100"
+      - "127.0.0.1:${LOKI_PORT:-3100}:3100"
     restart: unless-stopped
   tempo:
     image: grafana/tempo:2.7.2
@@ -61,7 +61,7 @@ services:
       - ./tempo.yaml:/etc/tempo.yaml:ro
       - tempo:/var/tempo
     ports:
-      - "127.0.0.1:3200:3200"
+      - "127.0.0.1:${TEMPO_PORT:-3200}:3200"
     restart: unless-stopped
   grafana:
     image: grafana/grafana:11.5.2
@@ -74,7 +74,7 @@ services:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
     ports:
-      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
     depends_on:
       prometheus:
         condition: service_started
@@ -91,7 +91,7 @@ services:
       context: .
       dockerfile: incident-response/Dockerfile
     ports:
-      - "127.0.0.1:8001:8001"
+      - "127.0.0.1:${INCIDENT_RESPONSE_PORT:-8001}:8001"
     environment:
       INCIDENT_DIR: /incidents
       ORDER_TRACKER_REPO: /workspace
