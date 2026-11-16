@@ -4,6 +4,9 @@ A small order tracking app for the AI Dev Tools Zoomcamp observability homework.
 
 The main user flow is creating an order and checking its status. Three sample orders are created on first startup.
 
+See the [formal product requirements](./docs/product/requirements.md) for user
+workflows, API behavior, safety gates, and acceptance criteria.
+
 ## Run it
 
 You need Docker with Compose. To run the Python tests, you also need Python 3.11+
@@ -145,7 +148,53 @@ The last endpoint shows current active alerts; an empty result means none are fi
 
 ## Incident response
 
-The local incident-response API listens on port `8001`. Grafana sends firing alerts to `POST http://incident-response:8001/alerts`. The responder saves incident details and the collected Loki logs/Tempo traces under `incident-response/incidents/`, and prepares a prompt for a headless coding assistant. Runtime incident artifacts are ignored by Git. A missing or failing assistant is recorded as such; an alert is not treated as resolved.
+The local incident-response API listens on port `8001`. Grafana sends firing alerts to `POST http://incident-response:8001/alerts`. The responder saves incident details and collected Loki logs/Tempo traces under `incident-response/incidents/`, and optionally requests a bounded diagnosis from GitHub Copilot CLI **v1.0.112**. Diagnosis is not remediation: the responder never applies a patch or resolves an incident. Runtime incident artifacts are ignored by Git. Alerts are still accepted and saved if the token or CLI is unavailable, or diagnosis fails.
+
+#### Configure the optional Copilot diagnosis
+
+The responder image alone contains the official standalone Linux Copilot CLI,
+pinned to v1.0.112 and verified during image build. No Copilot CLI, Node runtime,
+or host Copilot configuration is added to the main app image or mounted into the
+responder. The CLI runs non-interactively with only `view`, `grep`, and `glob`
+available; shell, write, URL, and all built-in MCP tools are disabled or denied.
+It starts in the mounted application source and adds only the mounted tests
+directory; current incident evidence is passed as untrusted prompt data, not
+exposed as a readable filesystem path.
+A fresh temporary `COPILOT_HOME` is used per diagnosis, and the child process
+receives only its required runtime environment plus `COPILOT_GITHUB_TOKEN`.
+
+Authentication requires a **user-owned fine-grained GitHub PAT** with the
+**Copilot Requests** permission. Classic PATs are not supported. Never send the
+token in chat, commit it, or add it to incident evidence. Create a local ignored
+`.env` from the blank example and edit it locally:
+
+```powershell
+Copy-Item .env.example .env
+notepad .env
+```
+
+Set `COPILOT_GITHUB_TOKEN` in `.env`, save it, then rebuild/restart only the
+responder service (Compose reads `.env` automatically):
+
+```powershell
+docker compose up --build -d --wait incident-response
+```
+
+To inspect an incident diagnosis, set its ID and read the files:
+
+```powershell
+$incidentId = "<incident_id>"
+Get-Content "incident-response\incidents\$incidentId\agent-output.json" -Raw
+Get-Content "incident-response\incidents\$incidentId\agent-response.txt" -Raw
+```
+
+`agent-output.json` distinguishes `completed` (validated structured diagnosis),
+`unavailable` (missing token or CLI), `malformed_output` (invalid JSON/schema),
+`failed` (CLI error/non-zero exit), `timeout`, and `configuration_error`.
+`agent-response.txt` retains only bounded, token-redacted raw output. No real
+authenticated model call was performed as part of automated tests; any local
+smoke test should be an intentional, one-time request after configuring the
+token and will create a new incident record.
 
 Set `IR_APPROVAL_TOKEN` in the environment before starting Compose; use a random secret of at least 32 characters and do not commit it. For example, in PowerShell:
 
@@ -154,7 +203,13 @@ $env:IR_APPROVAL_TOKEN = "<at-least-32-random-characters>"
 docker compose up --build -d --wait
 ```
 
-The assistant is instructed to be read-only; application and test mounts are read-only, but the configured assistant CLI must also be set to its no-edit/no-tools mode because a prompt is not a sandbox. Review and apply any patch yourself, then rebuild/restart the application before asking the responder to verify recovery:
+Copilot's CLI permission allowlist—not only the prompt—limits diagnosis to
+reading the mounted application source and tests. Current incident evidence is
+provided in the prompt as untrusted data and is not added as a readable path.
+The CLI has no shell, file-write, URL, MCP, plugin, or subagent-delegation
+tools. Alert content, logs, traces, and model output are untrusted. Review and
+apply any proposed patch yourself, then rebuild/restart the application before
+asking the responder to verify recovery:
 
 ```bash
 docker compose up --build -d --wait app
